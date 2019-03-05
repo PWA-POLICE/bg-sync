@@ -1,4 +1,6 @@
-const syncIds = [];
+import KEY from './key';
+
+const pendingsMap = {};
 
 export default function fetch(url, options) {
   if (!options) {
@@ -9,17 +11,18 @@ export default function fetch(url, options) {
     options.headers = {};
   }
 
-  options.headers['X-bgsync'] = 'true';
+  options.headers[KEY] = 'true';
 
   let resolveResult;
 
   window.fetch(url, options).then(
     res => {
-      // 103 Early Hints
-      const id = res.status === 103 && res.headers.get('X-bgsync-id');
+      // 202 Accepted
+      const id = res.status === 202 && res.headers.get(KEY + '-id');
 
       if (id) {
-        syncIds.push(id);
+        pendingsMap[id] = resolveResult;
+        scheduleInterval();
         return;
       }
 
@@ -33,6 +36,46 @@ export default function fetch(url, options) {
   return new Promise(resolve => (resolveResult = resolve));
 }
 
-window.addEventListener('message', e => {
-  console.log(e);
-});
+if (navigator.serviceWorker) {
+  navigator.serviceWorker.addEventListener('message', e => {
+    const data = e.data;
+
+    if (!(data && data[KEY] && data.action === 'done' && data.id)) {
+      return;
+    }
+
+    const callback = pendingsMap[data.id];
+    delete pendingsMap[data.id];
+
+    if (!callback) return;
+
+    caches.match('/' + data.id, {
+      cacheName: KEY + ':responses'
+    }).catch(() => {}).then(res => {
+      if (!res) return;
+
+      callback(res);
+    });
+  });
+}
+
+function scheduleInterval() {
+  if (interval) return;
+
+  if (!('SyncManager' in window && navigator.serviceWorker.controller)) {
+    return;
+  }
+
+  interval = setInterval(() => {
+    if (Object.keys(pendingsMap).length) {
+      navigator.serviceWorker.controller.postMessage({
+        [KEY]: true,
+        action: 'try'
+      });
+    }
+  }, 60 * 1000);
+}
+
+function cancelInterval() {
+
+}

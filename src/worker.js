@@ -1,48 +1,61 @@
 import nanoid from 'nanoid';
-import { get, set, Store } from 'idb-keyval';
+import { get, set, keys, Store } from 'idb-keyval';
+import PREFIX from './key';
 
-const PREFIX = 'X-bgsync';
 const TAG_PREFIX = `${PREFIX}:`;
 const STORE_NAME_PREFIX = `${PREFIX}:`;
 
-const requestsStore = new Store(`${PREFIX}-db`, STORE_NAME_PREFIX + 'requests');
+const requestsStore = new Store(`${PREFIX}-db`, 'requests');
+const syncTagsStore = new Store(`${PREFIX}-db`, 'tags');
 
 const requestsMemCache = {};
 
 self.addEventListener('fetch', e => {
   const isSync = e.request.headers.get(PREFIX);
+  // Do not process if it isn't a bg-sync request
+  if (!isSync) return;
 
-  if (isSync) return;
+  let id;
 
-  const id = nanoid();
+  try {
+    // Web Crypto isn't available in Edge in workers yet
+    id = nanoid();
+  } catch (e) {
+    id = Date.now() + (Math.random() + '').replace('.', '');
+  }
+
+  const tag = TAG_PREFIX + id + ':' + e.clientId;
 
   if (!registration.sync) {
-    e.request.headers.set(`${PREFIX}-id`, id);
+    requestsMemCache[id] = e.request.clone();
 
-    const fetching = fetch(e.request).then(
-      res => {
-        return respondToClients(id, res);
-      },
-      err => {
-        return respondToClients(id, Response.error());
-      }
+    e.waitUntil(
+      storeRequest(id, e.request).then(() => {
+        return registerSyncTag(tag);
+      }).then(() => {
+        return doSyncRequest(tag);
+      })
     );
 
     try {
       e.waitUntil(fetching);
-    } catch (e) {}
+    } catch (e) {
+      console.error(e);
+    }
   } else {
     requestsMemCache[id] = e.request.clone();
 
     e.waitUntil(
       storeRequest(id, e.request).then(() => {
-        return registration.sync(TAG_PREFIX + id);
+        return registration.sync.register(tag);
       })
     );
   }
 
   e.respondWith(
-    new Response(103, {
+    new Response(null, {
+      status: 202,
+      statusText: `Accepted ${PREFIX}`,
       headers: {
         [`${PREFIX}-id`]: id,
       },
@@ -55,7 +68,34 @@ self.addEventListener('sync', e => {
     return;
   }
 
-  const id = e.tag.slice(TAG_PREFIX.length);
+  e.waitUntil(doSyncRequest(e.tag));
+});
+
+if (!registration.sync) {
+  self.addEventListener('message', (e) => {
+    if (!(e.data && e.data[PREFIX] && e.data.action === 'try')) {
+      return;
+    }
+
+    const wait = keys(syncTagsStore).then(keys => {
+      if (!keys.length) return;
+
+      const all = keys.map(tag => {
+        return doSyncRequest(tag);
+      });
+
+      return Promise.all(all);
+    });
+
+    e.waitUntil(wait);
+  });
+
+  self.postMessage({ [PREFIX]: true, action: 'try' });
+}
+
+function doSyncRequest(tag) {
+  const [ _, id, clientId ] = tag.split(':');
+
   let synching = requestsMemCache[id] || retrieveRequest(id);
 
   synching = Promise.resolve(synching)
@@ -67,11 +107,15 @@ self.addEventListener('sync', e => {
     .then(res => {
       if (!res) return;
 
-      return respondToClients(id, res);
+      return respondToClient(id, res, clientId);
     });
 
-  e.waitUntil(synching);
-});
+  return synching;
+}
+
+function registerSyncTag(tag) {
+  return set(tag, {}, syncTagsStore);
+}
 
 function retrieveRequest(id) {
   return get(id, requestsStore).then(data => {
@@ -125,33 +169,40 @@ function replicateRequest(data) {
     return result;
   }, {});
 
-  options.headers = data.headers.reduce((result, pair) => {
-    result.set(pair[0], pair[1]);
+  options.headers = Object.keys(data.headers).reduce((result, key) => {
+    result.set(key, data.headers[key]);
     return result;
   }, new Headers());
 
   return new Request(data.url, options);
 }
 
-function respondToClients(id, response) {
-  clients
-    .matchAll({ includeUncontrolled: true })
-    .then(clients => {
-      if (!clients.length) return;
+function respondToClient(id, response, clientId) {
+  return clients.get(clientId)
+    .then(client => {
+      if (!client) return;
 
-      return caches.open(STORE_NAME_PREFIX + 'responses').then(cache => {
-        return cache.put('/' + id, response);
+      return caches
+        .open(STORE_NAME_PREFIX + 'responses')
+        .then(cache => {
+          return cache.put('/' + id, response);
+        })
+        .then(_ => client);
+    })
+    .then(client => {
+      if (!client) return;
+
+      client.postMessage({
+        [PREFIX]: true,
+        action: 'done',
+        id: id,
       });
     })
-    .then(clients => {
-      if (!clients.length) return;
-
-      clients.forEach(client => {
-        client.postMessage({
-          [PREFIX]: true,
-          action: 'done',
-          id: id,
-        });
-      });
+    .catch(err => {
+      console.error(err);
     });
+}
+
+export function onResponse() {
+
 }
